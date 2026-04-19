@@ -175,9 +175,9 @@ ui <- dashboardPage(
     ),
     hr(),
     tags$div(style="padding:10px 15px;color:#8899bb;font-size:11px;",
-      tags$b("IRT Analyzer v2.0"),tags$br(),
-      "Hambleton et al., Ch. 3 & 4",tags$br(),
-      "Dikotomus & Politomus")
+      tags$b("IRT Analisis"),tags$br(),
+      "Baru Coba-coba",tags$br(),
+      "Saran dongs")
   ),
   dashboardBody(
     tags$head(tags$script(HTML(
