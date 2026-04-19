@@ -66,9 +66,7 @@ msi_transform <- function(data, scale_min = NULL, scale_max = NULL) {
         VScale[i] <- if (denom < 1e-10) NA else (dens_lo - dens_hi) / denom
       }
       sc_min <- min(VScale, na.rm = TRUE)
-      # SESUAI STAT97 Excel: hanya SHIFT sehingga nilai minimum = scale_min (edMin)
-      # Nilai maksimum mengikuti distribusi data secara alami (TIDAK dipaksa ke edMax)
-      # formula: Scale_final = Scale_raw - min(Scale_raw) + edMin
+      
       if (!is.null(scale_min)) {
         VScale_final <- VScale - sc_min + scale_min
       } else {
@@ -246,12 +244,12 @@ ui <- dashboardPage(
                       tags$div(style="background:#fff8e6;border-left:4px solid #f39c12;border-radius:6px;padding:10px 14px;margin-bottom:8px;",
                                tags$b("⚙️ Pengaturan Skala MSI:"),tags$br(),
                                tags$small("Masukkan skala minimal instrumen Anda (misal: 1 untuk Likert 1-5)."),tags$br(),
-                               tags$small(style="color:#888;","Catatan: Nilai MSI minimum = edMin. Nilai maksimum mengikuti distribusi data (sama seperti add-in Excel STAT97)."),
+                               tags$small(style="color:#888;"),
                                fluidRow(
-                                 column(6, numericInput("msi_min","Skala Minimal (edMin):",value=1,min=0,step=1)),
-                                 column(6, numericInput("msi_max","Skala Maksimal (edMax):",value=5,min=1,step=1))
+                                 column(6, numericInput("msi_min","Skala Minimal:",value=1,min=0,step=1)),
+                                 column(6, numericInput("msi_max","Skala Maksimal:",value=5,min=1,step=1))
                                ),
-                               tags$small(style="color:#aaa;font-style:italic;","edMax digunakan hanya sebagai referensi validasi, tidak mempengaruhi perhitungan (sesuai STAT97)."),
+                               tags$small(style="color:#aaa;font-style:italic;","Tidak perlu gunakan MSI ketika data politomus yang digunakan adalah data interval"),
                                actionButton("apply_msi","🔁 Terapkan MSI",class="btn-warning btn-sm btn-block",
                                             style="margin-top:4px;")
                       )
@@ -263,7 +261,7 @@ ui <- dashboardPage(
                 )
               ),
               fluidRow(
-                box(title="👁️ Preview Data (10 baris pertama)", status="success",
+                box(title="Preview Data (10 baris pertama)", status="success",
                     solidHeader=TRUE, width=12,
                     uiOutput("preview_label"),
                     withSpinner(DTOutput("data_preview"),type=4,color="#4e9af1"),
@@ -286,7 +284,7 @@ ui <- dashboardPage(
                 box(title="📈 Scree Plot (Eigenvalue)", status="success", solidHeader=TRUE, width=7,
                     actionButton("run_scree","▶ Buat Scree Plot",class="btn-success"),
                     tags$div(class="info-callout",style="margin-top:8px;",
-                             "EV₁ >> EV₂: dominansi faktor pertama → unidimensionalitas terpenuhi."),
+                             "Terdapat dominansi faktor pertama, maka unidimensionalitas terpenuhi."),
                     hr(),
                     withSpinner(
                       plotlyOutput("scree_plot",height="380px",width="100%"),
@@ -297,11 +295,11 @@ ui <- dashboardPage(
                 box(title="🔗 Uji Local Independence — Yen's Q3 Statistic",
                     status="warning", solidHeader=TRUE, width=12,
                     tags$div(class="info-callout",
-                             tags$b("Statistik Yen's Q3 (Yen, 1984):"),tags$br(),
+                             tags$b("Statistik Yen's Q3:"),tags$br(),
                              "Q3 dihitung sebagai korelasi antara residual item i dan item j setelah kemampuan (θ) dikontrol.",tags$br(),
                              "✅ ",tags$b("Q3 ≤ 0.2:")," asumsi independensi lokal terpenuhi.",tags$br(),
-                             "⚠️ ",tags$b("Q3 > 0.2:")," ada ketergantungan lokal antara pasangan item tersebut.",tags$br(),
-                             "📌 ",tags$b("Catatan:")," Estimasi IRT harus dijalankan terlebih dahulu sebelum menghitung Q3."
+                             "⚠️ ",tags$b("Q3 > 0.2:")," ada ketergantungan lokal antara pasangan item tersebut.",
+                             
                     ),
                     actionButton("run_q3","▶ Hitung Yen's Q3",class="btn-warning"),
                     hr(),
@@ -373,7 +371,7 @@ ui <- dashboardPage(
       # ── TAB 4: MODEL-DATA FIT ─────────────────────────────
       tabItem(tabName="model_fit",
               fluidRow(
-                box(title="📊 Item Fit Statistics — Q₁ (Yen, 1981)", status="warning",
+                box(title="📊 Item Fit Statistics", status="warning",
                     solidHeader=TRUE, width=12,
                     tags$div(class="formula-box",
                              "Q₁ = Σⱼ Nⱼ(Pᵢⱼ − E(Pᵢⱼ))² / [E(Pᵢⱼ)(1 − E(Pᵢⱼ))]",tags$br(),
@@ -400,10 +398,16 @@ ui <- dashboardPage(
                 box(title="📊 Distribusi Standardized Residuals (zᵢⱼ)", status="success",
                     solidHeader=TRUE, width=5,
                     tags$div(class="info-callout",
-                             "zᵢⱼ ≈ Normal(0,1) → model fit.",tags$br(),
-                             "Distribusi real (biru) vs referensi normal (merah putus-putus)."),
+                             tags$b("Distribusi ≈ Normal(0,1)")," model fit dengan baik.",
+                             " Artinya prediksi model rata-rata tepat, kesalahan acak dan simetris.",tags$br(),
+                             "⚠️ ",tags$b("Distribusi miring")," model sistematis salah:",
+                             " terlalu over-prediksi atau under-prediksi.",tags$br(),
+                             "❌ ",tags$b("Distribusi terlalu lebar / banyak |z| > 2")," → model",
+                             " banyak meleset; model mungkin tidak fit untuk item-item tertentu.",
+                             " |z| > 3 = sangat bermasalah."
+                    ),
                     withSpinner(
-                      plotlyOutput("std_resid_hist",height="430px",width="100%"),
+                      plotlyOutput("std_resid_hist",height="380px",width="100%"),
                       type=4,color="#2ecc71")
                 )
               ),
@@ -419,20 +423,40 @@ ui <- dashboardPage(
                 box(title="🔄 Invariansi Parameter Item",
                     status="danger", solidHeader=TRUE, width=12,
                     tags$div(class="info-callout",
-                             tags$b("Dasar Teori — Hambleton et al. (1991, Ch. 2 & 4):"),tags$br(),
-                             "Invariansi dicek SETELAH model dipilih dan diestimasi karena:",tags$br(),
-                             "① Invariansi adalah SIFAT MODEL yang fit, bukan sifat data mentah.",tags$br(),
-                             "② Jika model tidak fit, parameter berubah antar subkelompok.",tags$br(),
-                             "③ Cara: estimasi parameter di dua kelompok terpisah, bandingkan",
-                             " via scatterplot, titik harus dekat diagonal (slope ≈ 1, r ≈ 1)."
+                             tags$b("Keterangan:"),tags$br(),
+                             "Invariansi dicek setelah model dipilih dan diestimasi karena:",tags$br(),
+                             "1. Invariansi adalah sifat model yang fit, bukan sifat data awal.",tags$br(),
+                             "2. Jika model tidak fit, parameter berubah antar subkelompok.",tags$br(),
+                             "3. Cara: estimasi parameter di dua kelompok terpisah, bandingkan",
+                             " via scatterplot, titik harus membentuk pola garis y = x, sebagai garis
+                             acuan."
                     ),
                     fluidRow(
                       column(4,
                              selectInput("inv_split","Cara pembagian sampel:",
                                          choices=c(
-                                           "Median Raw Score (Low vs High)"="median",
-                                           "Tertile (Bawah vs Atas 33%)"="tertile",
-                                           "Random 50:50"="random")),
+                                           "Random 50:50"="random",
+                                           "Ganjil vs Genap (nomor urut peserta)"="odd_even",
+                                           "Upload file kelompok (CSV/XLSX)"="file_group")),
+                             # Kondisional: tampil hanya jika pilih file_group
+                             conditionalPanel(
+                               condition="input.inv_split == 'file_group'",
+                               tags$div(style="background:#f0f8ff;border:1px solid #cce;border-radius:6px;padding:10px;margin-top:6px;",
+                                        tags$b("📂 Upload File Kelompok"),tags$br(),
+                                        tags$small("Format: satu kolom berisi label kelompok per baris,",tags$br(),
+                                                   "urutan baris sesuai urutan peserta di data utama.",tags$br(),
+                                                   "Contoh isi: Laki-laki / Perempuan, Suku A / Suku B, dll."),
+                                        tags$br(),tags$br(),
+                                        fileInput("inv_group_file", NULL,
+                                                  accept=c(".csv",".xlsx",".xls"),
+                                                  placeholder="Pilih file..."),
+                                        checkboxInput("inv_group_header","Baris pertama = header",value=TRUE),
+                                        selectInput("inv_sep_group","Separator CSV:",
+                                                    choices=c("Koma"=",","Titik koma"=";","Tab"="\t")),
+                                        uiOutput("inv_group_preview_ui")
+                               )
+                             ),
+                             tags$br(),
                              actionButton("run_invariance","🔄 Cek Invariansi Item",
                                           class="btn-danger btn-block",style="margin-top:8px;")
                       ),
@@ -457,16 +481,16 @@ ui <- dashboardPage(
                 box(title="🎯 Invariansi Parameter Ability (θ)",
                     status="success", solidHeader=TRUE, width=12,
                     tags$div(class="info-callout",
-                             tags$b("Konsep (Hambleton et al., 1991, Gambar 4.3 & 4.4):"),tags$br(),
+                             tags$b("Konsep:"),tags$br(),
                              "Estimasi θ dari dua set item berbeda seharusnya konsisten.",
-                             " Scatterplot θ_A vs θ_B harus mendekati diagonal (slope≈1).",tags$br(),
-                             "Scatter besar, ability tidak stabil lintas item, model mungkin tidak fit."
+                             " Scatterplot θA vs θB harus membentuk garis acuan.",tags$br(),
+                             "Apabila terlalu menyebar, kemampuan mungkin tidak stabil lintas item, model mungkin tidak fit."
                     ),
                     fluidRow(
                       column(3,
                              selectInput("inv_ability_split","Pembagian item:",
                                          choices=c(
-                                           "Ganjil vs Genap (Odd-Even)"="odd_even",
+                                           "Ganjil vs Genap"="odd_even",
                                            "Paruh Awal vs Akhir"="first_last",
                                            "Random Split Item"="random_item")),
                              actionButton("run_inv_ability","▶ Cek Invariansi Ability",
@@ -491,17 +515,16 @@ ui <- dashboardPage(
                              tags$div(class="formula-box",style="font-size:18px;",
                                       "T = 50 + 10 × θᵢ",tags$br(),tags$br(),
                                       tags$small(style="font-size:12px;",
-                                                 "θᵢ = estimasi ability (hasil EAP/MAP/MLE) examinee ke-i",tags$br(),
+                                                 "θᵢ = estimasi ability (hasil EAP/MAP/MLE) peserta ke-i",tags$br(),
                                                  "z = θ (digunakan langsung sebagai skor standar)"))
                       ),
                       column(7,
                              tags$div(class="info-callout",
-                                      tags$b("Interpretasi T-Score (McCall's T):"),tags$br(),
-                                      "• T = 50 → θ = 0; kemampuan rata-rata populasi (mean normatif)",tags$br(),
-                                      "• T = 60 → θ = +1; satu SD di atas rata-rata",tags$br(),
-                                      "• T = 40 → θ = −1; satu SD di bawah rata-rata",tags$br(),
-                                      "• Skala: mean = 50, SD = 10 (standar T-score)",tags$br(),
-                                      tags$b("Formula: T = 50 + 10 × θ (setara z-score × 10 + 50)"))
+                                      tags$b("Interpretasi T-Score:"),tags$br(),
+                                      "• T = 50 → θ = 0; kemampuan rata-rata pada skala IRT (mean = 0)",tags$br(),
+                                      "• T = 60 → θ = +1; kemampuan satu deviasi standar di atas rata-rata",tags$br(),
+                                      "• T = 40 → θ = −1; menunjukkan kemampuan satu deviasi standar di bawah rata-rata",tags$br(),
+                                      tags$b("Formula: T = 50 + 10 × θ"))
                       )
                     )
                 )
@@ -549,17 +572,17 @@ ui <- dashboardPage(
                                  tags$th("Model"),tags$th("Data"),tags$th("Parameter"),tags$th("Keterangan"))),
                                tags$tbody(
                                  tags$tr(tags$td("1PL"),tags$td("Dikotomus"),tags$td("b"),
-                                         tags$td("Rasch — semua item sama diskriminasinya")),
+                                         tags$td("semua item sama diskriminasinya")),
                                  tags$tr(tags$td("2PL"),tags$td("Dikotomus"),tags$td("a, b"),
-                                         tags$td("Birnbaum — diskriminasi + kesulitan")),
+                                         tags$td("diskriminasi dan tingkat kesulitan")),
                                  tags$tr(tags$td("3PL"),tags$td("Dikotomus"),tags$td("a, b, c"),
-                                         tags$td("+ pseudo-chance (efek menebak)")),
+                                         tags$td("diskriminasi, tingkat kesulitanm, peluang menebak dengan benar")),
                                  tags$tr(tags$td("PCM"),tags$td("Politomus"),tags$td("b"),
-                                         tags$td("Partial Credit (Masters, 1982)")),
+                                         tags$td("Partial Credit Model")),
                                  tags$tr(tags$td("GPCM"),tags$td("Politomus"),tags$td("a, b"),
                                          tags$td("Generalized PCM")),
                                  tags$tr(tags$td("GRM"),tags$td("Politomus"),tags$td("a, b"),
-                                         tags$td("Graded Response (Samejima, 1969)")))
+                                         tags$td("Graded Response Model")))
                     )
                 ),
                 box(title="📚 Referensi", status="success", solidHeader=TRUE, width=5,
@@ -636,7 +659,7 @@ server <- function(input, output, session) {
   output$data_summary_boxes <- renderUI({
     req(rv$raw_data); df <- rv$raw_data
     fluidRow(
-      valueBox(nrow(df),"Examinee",icon=icon("users"),  color="blue",  width=4),
+      valueBox(nrow(df),"Peserta",icon=icon("users"),  color="blue",  width=4),
       valueBox(ncol(df),"Item",    icon=icon("list"),   color="green", width=4),
       valueBox(toupper(rv$data_type),"Jenis",icon=icon("tag"),color="orange",width=4))
   })
@@ -722,7 +745,7 @@ server <- function(input, output, session) {
                                                             ";font-weight:bold;"),
                                                if(bp<0.05)"Signifikan ✅"else"Tidak Signifikan ⚠️"))))),
         tags$div(class=if(kv>=0.6&&bp<0.05)"info-callout"else"warn-callout",
-                 if(kv>=0.6&&bp<0.05)"✅ Prasyarat terpenuhi — lanjutkan ke IRT."
+                 if(kv>=0.6&&bp<0.05)"✅ Prasyarat terpenuhi dapat lanjutkan ke IRT."
                  else"⚠️ Periksa item atau sampel sebelum lanjut.")
       ))
     }, error=function(e) output$kmo_result <- renderUI(
@@ -889,9 +912,9 @@ server <- function(input, output, session) {
       tags$div(class="warn-callout","⚠️ Upload data terlebih dahulu."))
     tags$div(class="info-callout",
              tags$b("Panduan Keputusan Asumsi:"),tags$br(),
-             "1. ",tags$b("KMO ≥ 0.6 & Bartlett p<0.05:")," → lanjutkan analisis.",tags$br(),
-             "2. ",tags$b("Scree Plot — EV₁>>EV₂:")," → unidimensionalitas terpenuhi.",tags$br(),
-             "3. ",tags$b("Yen's Q3 ≤ 0.2 (semua pasangan item):")," → independensi lokal terpenuhi.",tags$br(),
+             "1. ",tags$b("KMO ≥ 0.5 & Bartlett p<0.05:")," lanjutkan analisis.",tags$br(),
+             "2. ",tags$b("Terdapat dominasi faktor pertama pada scree plot:")," unidimensionalitas terpenuhi.",tags$br(),
+             "3. ",tags$b("Yen's Q3 ≤ 0.2:")," independensi lokal terpenuhi.",tags$br(),
              "4. ",tags$b("Catatan:")," Jalankan estimasi IRT terlebih dahulu, lalu hitung Q3 untuk hasil yang akurat.")
   })
   
@@ -1129,34 +1152,92 @@ server <- function(input, output, session) {
     filename=function()paste0("item_fit_",Sys.Date(),".csv"),
     content=function(f)write.csv(rv$fit_results,f,row.names=FALSE))
   
+  # ── PREVIEW FILE KELOMPOK ───────────────────────────────
+  output$inv_group_preview_ui <- renderUI({
+    req(input$inv_group_file)
+    tryCatch({
+      ext <- tools::file_ext(input$inv_group_file$name)
+      gdf <- if (ext %in% c("xlsx","xls"))
+        as.data.frame(read_excel(input$inv_group_file$datapath,
+                                 col_names=input$inv_group_header))
+      else
+        read.csv(input$inv_group_file$datapath,
+                 header=input$inv_group_header, sep=input$inv_sep_group)
+      grp_col <- gdf[, 1]
+      grp_tbl <- table(grp_col)
+      grp_names <- names(grp_tbl)
+      if (length(grp_names) != 2) {
+        return(tags$div(class="warn-callout",
+                        tags$b("⚠️ File harus memiliki tepat 2 kelompok."),tags$br(),
+                        paste0("Terdeteksi ",length(grp_names)," kelompok: ",
+                               paste(grp_names, collapse=", "))))
+      }
+      tags$div(class="info-callout", style="margin-top:6px;font-size:12px;",
+               tags$b("✅ File kelompok valid:"),tags$br(),
+               paste0("• ", grp_names[1], ": ", grp_tbl[1], " peserta"),tags$br(),
+               paste0("• ", grp_names[2], ": ", grp_tbl[2], " peserta"),tags$br(),
+               paste0("Total: ", length(grp_col), " baris")
+      )
+    }, error=function(e)
+      tags$div(class="warn-callout", paste("Error baca file:", e$message)))
+  })
+  
   # ── INVARIANSI ──────────────────────────────────────────
   observeEvent(input$run_invariance, {
     req(rv$clean_data, rv$irt_model)
     withProgress(message="Cek invariansi parameter item...", value=0, {
       tryCatch({
         df  <- rv$clean_data
-        sc  <- rowSums(df,na.rm=TRUE)
         itp <- get_itemtype(input$model_choice)
         
-        if (input$inv_split=="median") {
-          md<-median(sc); i1<-which(sc<=md); i2<-which(sc>md)
-          l1<-"Low Ability"; l2<-"High Ability"
-        } else if (input$inv_split=="tertile") {
-          q33<-quantile(sc,1/3); q67<-quantile(sc,2/3)
-          i1<-which(sc<=q33); i2<-which(sc>=q67)
-          l1<-"Bottom Tertile"; l2<-"Top Tertile"
-        } else {
-          set.seed(42); i1<-sample(1:nrow(df),floor(nrow(df)/2))
-          i2<-setdiff(1:nrow(df),i1)
-          l1<-"Random G1"; l2<-"Random G2"
+        if (input$inv_split == "random") {
+          set.seed(42)
+          i1 <- sort(sample(1:nrow(df), floor(nrow(df)/2)))
+          i2 <- setdiff(1:nrow(df), i1)
+          l1 <- "Kelompok Random 1"; l2 <- "Kelompok Random 2"
+          
+        } else if (input$inv_split == "odd_even") {
+          i1 <- seq(1, nrow(df), by=2)   # baris ganjil
+          i2 <- seq(2, nrow(df), by=2)   # baris genap
+          l1 <- "Peserta Ganjil"; l2 <- "Peserta Genap"
+          
+        } else if (input$inv_split == "file_group") {
+          req(input$inv_group_file)
+          ext <- tools::file_ext(input$inv_group_file$name)
+          gdf <- if (ext %in% c("xlsx","xls"))
+            as.data.frame(read_excel(input$inv_group_file$datapath,
+                                     col_names=input$inv_group_header))
+          else
+            read.csv(input$inv_group_file$datapath,
+                     header=input$inv_group_header, sep=input$inv_sep_group)
+          grp_col   <- as.character(gdf[, 1])
+          grp_names <- unique(grp_col)
+          if (length(grp_names) != 2) {
+            showNotification("⚠️ File kelompok harus memiliki tepat 2 kelompok.",
+                             type="warning"); return()
+          }
+          if (length(grp_col) != nrow(df)) {
+            showNotification(
+              paste0("⚠️ Jumlah baris file kelompok (",length(grp_col),
+                     ") tidak sama dengan jumlah peserta data (",nrow(df),")."),
+              type="error"); return()
+          }
+          i1 <- which(grp_col == grp_names[1])
+          i2 <- which(grp_col == grp_names[2])
+          l1 <- grp_names[1]; l2 <- grp_names[2]
         }
         
-        incProgress(0.35,detail=paste("Estimasi",l1,"..."))
+        if (length(i1) < 5 || length(i2) < 5) {
+          showNotification("⚠️ Salah satu kelompok terlalu kecil (min. 5 peserta).",
+                           type="warning"); return()
+        }
+        
+        incProgress(0.35, detail=paste("Estimasi", l1, "..."))
         f1 <- tryCatch(mirt(df[i1,,drop=FALSE],1,itemtype=itp,
-                            verbose=FALSE,SE=FALSE),error=function(e)NULL)
-        incProgress(0.35,detail=paste("Estimasi",l2,"..."))
+                            verbose=FALSE,SE=FALSE), error=function(e)NULL)
+        incProgress(0.35, detail=paste("Estimasi", l2, "..."))
         f2 <- tryCatch(mirt(df[i2,,drop=FALSE],1,itemtype=itp,
-                            verbose=FALSE,SE=FALSE),error=function(e)NULL)
+                            verbose=FALSE,SE=FALSE), error=function(e)NULL)
         
         if (is.null(f1)||is.null(f2)) {
           showNotification("⚠️ Estimasi gagal — sampel terlalu kecil.",type="warning")
@@ -1169,18 +1250,19 @@ server <- function(input, output, session) {
         b1  <- get_b_params(p1); b2 <- get_b_params(p2)
         a1  <- get_a_params(p1); a2 <- get_a_params(p2)
         
-        rb  <- if(!is.null(b1)&&!is.null(b2))
+        rb <- if(!is.null(b1)&&!is.null(b2))
           round(cor(b1,b2,use="pairwise.complete.obs"),3) else NA
-        ra  <- if(!is.null(a1)&&!is.null(a2))
+        ra <- if(!is.null(a1)&&!is.null(a2))
           round(cor(a1,a2,use="pairwise.complete.obs"),3) else NA
         
         output$inv_stats_ui <- renderUI(tagList(
           fluidRow(
-            valueBox(length(i1),paste("N",l1),icon=icon("users"),color="blue",width=4),
-            valueBox(length(i2),paste("N",l2),icon=icon("users"),color="green",width=4),
-            valueBox(if(!is.na(rb))rb else"—","r (parameter b)",
+            valueBox(length(i1), paste("N", l1), icon=icon("users"), color="blue",  width=4),
+            valueBox(length(i2), paste("N", l2), icon=icon("users"), color="green", width=4),
+            valueBox(if(!is.na(rb))rb else "—", "r (parameter b)",
                      icon=icon("chart-line"),
-                     color=if(!is.na(rb)&&rb>=0.9)"green"else if(!is.na(rb)&&rb>=0.7)"yellow"else"red",
+                     color=if(!is.na(rb)&&rb>=0.9)"green"
+                     else if(!is.na(rb)&&rb>=0.7)"yellow" else "red",
                      width=4)),
           tags$div(class=if(!is.na(rb)&&rb>=0.9)"info-callout"else"warn-callout",
                    tags$b("Hasil Invariansi Parameter b: "),
@@ -1195,10 +1277,9 @@ server <- function(input, output, session) {
         output$inv_a_panel <- renderUI({
           has_a <- !is.null(a1)&&!is.null(a2)
           if (has_a) {
-            tagList(
-              withSpinner(
-                plotlyOutput("inv_a_plot",height="430px",width="100%"),
-                type=4,color="#3498db"))
+            tagList(withSpinner(
+              plotlyOutput("inv_a_plot",height="430px",width="100%"),
+              type=4,color="#3498db"))
           } else {
             tags$div(class="info-callout",
                      tags$b("Parameter a tidak tersedia untuk model ini."),tags$br(),
@@ -1210,9 +1291,9 @@ server <- function(input, output, session) {
         if (!is.null(a1)&&!is.null(a2))
           output$inv_a_plot <- renderPlotly(make_inv_plot(a1,a2,nms,"a",l1,l2))
         
-        showNotification("✅ Invariansi parameter item selesai!",type="message")
+        showNotification("✅ Invariansi parameter item selesai!", type="message")
       }, error=function(e)
-        showNotification(paste("❌ Error:",e$message),type="error"))
+        showNotification(paste("❌ Error:", e$message), type="error"))
     })
   })
   
