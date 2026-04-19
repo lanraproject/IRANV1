@@ -33,34 +33,66 @@ suppressPackageStartupMessages({
 #   HELPER FUNCTIONS
 # ============================================================
 
-msi_transform <- function(data) {
+msi_transform <- function(data, scale_min = NULL, scale_max = NULL) {
   tryCatch({
-    result <- data
+    result         <- data
+    all_scale_list <- list()
     for (j in 1:ncol(data)) {
       x    <- data[, j]
+      n    <- sum(!is.na(x))
       cats <- sort(unique(x[!is.na(x)]))
-      if (length(cats) <= 1) next
-      cum_props  <- cumsum(table(x) / sum(!is.na(x)))
-      cum_props  <- cum_props[-length(cum_props)]
-      z_vals     <- qnorm(pmin(pmax(cum_props, 0.001), 0.999))
-      boundaries <- c(-3.5, z_vals, 3.5)
-      midpoints  <- numeric(length(cats))
-      for (k in seq_along(cats)) {
-        lo <- boundaries[k]; hi <- boundaries[k + 1]
-        mp <- (dnorm(lo) - dnorm(hi)) / (pnorm(hi) - pnorm(lo) + 1e-10)
-        midpoints[k] <- mp
+      K    <- length(cats)
+      if (K <= 1) next
+      freq_tbl <- table(factor(x, levels = cats))
+      VFreq    <- as.numeric(freq_tbl)
+      VProp    <- VFreq / n
+      VCum     <- cumsum(VProp)
+      VZ    <- numeric(K)
+      VDens <- numeric(K)
+      for (i in 1:(K - 1)) {
+        z_i      <- qnorm(pmin(pmax(VCum[i], 1e-6), 1 - 1e-6))
+        VZ[i]    <- z_i
+        VDens[i] <- dnorm(z_i)
       }
+      VZ[K]    <- Inf
+      VDens[K] <- 0
+      VScale <- numeric(K)
+      for (i in 1:K) {
+        dens_lo <- if (i == 1) 0    else VDens[i - 1]
+        dens_hi <- VDens[i]
+        cum_lo  <- if (i == 1) 0    else VCum[i - 1]
+        cum_hi  <- if (i == K) 1    else VCum[i]
+        denom   <- cum_hi - cum_lo
+        VScale[i] <- if (denom < 1e-10) NA else (dens_lo - dens_hi) / denom
+      }
+      sc_min <- min(VScale, na.rm = TRUE)
+      # SESUAI STAT97 Excel: hanya SHIFT sehingga nilai minimum = scale_min (edMin)
+      # Nilai maksimum mengikuti distribusi data secara alami (TIDAK dipaksa ke edMax)
+      # formula: Scale_final = Scale_raw - min(Scale_raw) + edMin
+      if (!is.null(scale_min)) {
+        VScale_final <- VScale - sc_min + scale_min
+      } else {
+        VScale_final <- VScale - sc_min   # shift ke 0 jika edMin tidak disediakan
+      }
+      all_scale_list[[colnames(data)[j]]] <- data.frame(
+        Kategori  = cats,
+        Frek      = VFreq,
+        Proporsi  = round(VProp, 4),
+        Kum       = round(VCum,  4),
+        Densitas  = round(VDens, 4),
+        Z         = round(ifelse(is.infinite(VZ), NA, VZ), 4),
+        Nilai_MSI = round(VScale_final, 4)
+      )
       for (k in seq_along(cats))
-        result[!is.na(data[,j]) & data[,j] == cats[k], j] <- midpoints[k]
+        result[!is.na(data[, j]) & data[, j] == cats[k], j] <- VScale_final[k]
     }
-    as.data.frame(result)
-  }, error = function(e) data)
+    list(data = as.data.frame(result), mapping = all_scale_list)
+  }, error = function(e) list(data = data, mapping = list()))
 }
 
 transform_scores <- function(theta_vec) {
-  theta_max <- max(abs(theta_vec), na.rm = TRUE)
-  if (theta_max == 0) theta_max <- 1
-  50 + (theta_vec / theta_max) * 100
+  # T = 50 + 10*z  di mana z = theta (hasil estimasi IRT langsung)
+  50 + 10 * theta_vec
 }
 
 detect_data_type <- function(df) {
@@ -92,8 +124,8 @@ get_a_params <- function(params_df) {
 }
 
 get_itemtype <- function(model_choice) switch(model_choice,
-                                              "1PL"="Rasch","2PL"="2PL","3PL"="3PLu",
-                                              "PCM"="PC","GPCM"="gpcm","GRM"="graded")
+                                              "1PL"="1PL","2PL"="2PL","3PL"="3PL",
+                                              "PCM"="Rasch","GPCM"="gpcm","GRM"="graded")
 
 make_inv_plot <- function(x_vec, y_vec, labels, param_name, lab1, lab2) {
   ok    <- is.finite(x_vec) & is.finite(y_vec)
@@ -209,6 +241,21 @@ ui <- dashboardPage(
                     checkboxInput("use_msi",
                                   HTML("<b>Gunakan MSI (Method of Successive Intervals)</b><br>
                 <small>Hanya untuk data politomus.</small>"), value=FALSE),
+                    conditionalPanel(
+                      condition="input.use_msi == true",
+                      tags$div(style="background:#fff8e6;border-left:4px solid #f39c12;border-radius:6px;padding:10px 14px;margin-bottom:8px;",
+                               tags$b("⚙️ Pengaturan Skala MSI:"),tags$br(),
+                               tags$small("Masukkan skala minimal instrumen Anda (misal: 1 untuk Likert 1-5)."),tags$br(),
+                               tags$small(style="color:#888;","Catatan: Nilai MSI minimum = edMin. Nilai maksimum mengikuti distribusi data (sama seperti add-in Excel STAT97)."),
+                               fluidRow(
+                                 column(6, numericInput("msi_min","Skala Minimal (edMin):",value=1,min=0,step=1)),
+                                 column(6, numericInput("msi_max","Skala Maksimal (edMax):",value=5,min=1,step=1))
+                               ),
+                               tags$small(style="color:#aaa;font-style:italic;","edMax digunakan hanya sebagai referensi validasi, tidak mempengaruhi perhitungan (sesuai STAT97)."),
+                               actionButton("apply_msi","🔁 Terapkan MSI",class="btn-warning btn-sm btn-block",
+                                            style="margin-top:4px;")
+                      )
+                    ),
                     tags$div(class="warn-callout",
                              "⚠️ MSI diabaikan untuk data dikotomus."),
                     hr(),
@@ -218,7 +265,10 @@ ui <- dashboardPage(
               fluidRow(
                 box(title="👁️ Preview Data (10 baris pertama)", status="success",
                     solidHeader=TRUE, width=12,
-                    withSpinner(DTOutput("data_preview"),type=4,color="#4e9af1"))
+                    uiOutput("preview_label"),
+                    withSpinner(DTOutput("data_preview"),type=4,color="#4e9af1"),
+                    uiOutput("msi_mapping_ui")
+                )
               )
       ),
       
@@ -244,22 +294,29 @@ ui <- dashboardPage(
                 )
               ),
               fluidRow(
-                box(title="🔗 Uji Local Independence — Inter-item Correlation Matrix",
+                box(title="🔗 Uji Local Independence — Yen's Q3 Statistic",
                     status="warning", solidHeader=TRUE, width=12,
                     tags$div(class="info-callout",
-                             tags$b("Interpretasi Local Independence dari heatmap ini:"),tags$br(),
-                             "✅ ",tags$b("Warna oranye muda dominan (r ≈ 0):"),
-                             " korelasi bivariat antar item rendah = indikasi LI terpenuhi.",tags$br(),
-                             "⚠️ ",tags$b("Bercak merah sistemik:"),
-                             " ada dimensi lain yang mempengaruhi respons = LI mungkin terlanggar.",tags$br(),
-                             "📌 ",tags$b("Catatan penting:"),
-                             " Heatmap ini SEBELUM ability dikontrol."
+                             tags$b("Statistik Yen's Q3 (Yen, 1984):"),tags$br(),
+                             "Q3 dihitung sebagai korelasi antara residual item i dan item j setelah kemampuan (θ) dikontrol.",tags$br(),
+                             "✅ ",tags$b("Q3 ≤ 0.2:")," asumsi independensi lokal terpenuhi.",tags$br(),
+                             "⚠️ ",tags$b("Q3 > 0.2:")," ada ketergantungan lokal antara pasangan item tersebut.",tags$br(),
+                             "📌 ",tags$b("Catatan:")," Estimasi IRT harus dijalankan terlebih dahulu sebelum menghitung Q3."
                     ),
-                    actionButton("run_li","▶ Hitung Matriks Korelasi",class="btn-warning"),
+                    actionButton("run_q3","▶ Hitung Yen's Q3",class="btn-warning"),
                     hr(),
-                    withSpinner(
-                      plotlyOutput("corr_heatmap",height="450px",width="100%"),
-                      type=4,color="#f39c12")
+                    fluidRow(
+                      column(8,
+                             withSpinner(
+                               plotlyOutput("q3_heatmap",height="450px",width="100%"),
+                               type=4,color="#f39c12")
+                      ),
+                      column(4,
+                             withSpinner(uiOutput("q3_summary_ui"),type=4,color="#f39c12"),
+                             hr(),
+                             withSpinner(DTOutput("q3_violation_table"),type=4,color="#f39c12")
+                      )
+                    )
                 )
               ),
               fluidRow(
@@ -432,19 +489,19 @@ ui <- dashboardPage(
                     fluidRow(
                       column(5,
                              tags$div(class="formula-box",style="font-size:18px;",
-                                      "T = 50 + ( θᵢ / θ_max ) × 100",tags$br(),tags$br(),
+                                      "T = 50 + 10 × θᵢ",tags$br(),tags$br(),
                                       tags$small(style="font-size:12px;",
-                                                 "θᵢ = estimasi ability examinee ke-i",tags$br(),
-                                                 "θ_max = max|θ| dalam sampel"))
+                                                 "θᵢ = estimasi ability (hasil EAP/MAP/MLE) examinee ke-i",tags$br(),
+                                                 "z = θ (digunakan langsung sebagai skor standar)"))
                       ),
                       column(7,
                              tags$div(class="info-callout",
-                                      tags$b("Interpretasi T-Score:"),tags$br(),
-                                      "• T = 50 → θ = 0; kemampuan rata-rata sampel",tags$br(),
-                                      "• T = 150 → θ_max; kemampuan tertinggi",tags$br(),
-                                      "• T = −50 → −θ_max; kemampuan terendah",tags$br(),
-                                      tags$b("Catatan:")," Berbeda dari standar T-score (mean=50, SD=10)."
-                             )
+                                      tags$b("Interpretasi T-Score (McCall's T):"),tags$br(),
+                                      "• T = 50 → θ = 0; kemampuan rata-rata populasi (mean normatif)",tags$br(),
+                                      "• T = 60 → θ = +1; satu SD di atas rata-rata",tags$br(),
+                                      "• T = 40 → θ = −1; satu SD di bawah rata-rata",tags$br(),
+                                      "• Skala: mean = 50, SD = 10 (standar T-score)",tags$br(),
+                                      tags$b("Formula: T = 50 + 10 × θ (setara z-score × 10 + 50)"))
                       )
                     )
                 )
@@ -479,7 +536,7 @@ ui <- dashboardPage(
                     tags$ol(
                       tags$li("Upload data → ",tags$b("Data Input")),
                       tags$li("Cek prasyarat → ",tags$b("Uji Asumsi"),
-                              " (KMO≥0.5, Bartlett p<0.05, Scree Plot)"),
+                              " (KMO≥0.5, Bartlett p<0.05, Scree Plot, Yen's Q3)"),
                       tags$li("Pilih model & estimasi → ",tags$b("Estimasi IRT")),
                       tags$li("Evaluasi fit → ",tags$b("Model-Data Fit")," (Q₁, residual plot)"),
                       tags$li("Cek invariansi → ",tags$b("Uji Invariansi"),
@@ -541,7 +598,9 @@ server <- function(input, output, session) {
     irt_model     = NULL,
     theta_results = NULL,
     item_params   = NULL,
-    fit_results   = NULL
+    fit_results   = NULL,
+    msi_applied   = FALSE,
+    msi_mapping   = NULL
   )
   
   # ── DATA INPUT ──────────────────────────────────────────
@@ -559,6 +618,8 @@ server <- function(input, output, session) {
       rv$raw_data   <- df_num
       rv$data_type  <- detect_data_type(df_num)
       rv$clean_data <- df_num
+      rv$msi_applied <- FALSE
+      rv$msi_mapping <- NULL
       nms <- colnames(df_num)
       updateSelectInput(session,"icc_items",  choices=nms, selected=nms[1:min(4,length(nms))])
       updateSelectInput(session,"fit_item_sel",choices=nms, selected=nms[1])
@@ -580,18 +641,67 @@ server <- function(input, output, session) {
       valueBox(toupper(rv$data_type),"Jenis",icon=icon("tag"),color="orange",width=4))
   })
   
+  output$preview_label <- renderUI({
+    if (isTRUE(rv$msi_applied)) {
+      tags$div(class="info-callout", style="margin-bottom:6px;",
+               tags$b("🔁 Menampilkan data setelah transformasi MSI"),
+               paste0(" (skala ",input$msi_min," – ",input$msi_max,")"))
+    } else {
+      tags$div(class="info-callout", style="margin-bottom:6px;",
+               tags$b("📄 Menampilkan data asli (sebelum MSI)"))
+    }
+  })
+  
   output$data_preview <- renderDT({
     req(rv$raw_data)
-    datatable(head(rv$raw_data,10),
+    preview_data <- if (isTRUE(rv$msi_applied) && !is.null(rv$clean_data))
+      head(rv$clean_data, 10) else head(rv$raw_data, 10)
+    datatable(preview_data,
               options=list(scrollX=TRUE,pageLength=10,dom="t"),
-              class="table-bordered table-sm")
+              class="table-bordered table-sm") %>%
+      formatRound(which(sapply(preview_data, is.numeric)), digits=4)
+  })
+  
+  output$msi_mapping_ui <- renderUI({
+    req(rv$msi_mapping)
+    if (length(rv$msi_mapping)==0) return(NULL)
+    tagList(
+      tags$hr(),
+      tags$b("📊 Tabel Detail MSI per Item (Frek | Prop | Kum | Densitas | Z | Nilai_MSI):"),
+      tags$br(), tags$br(),
+      lapply(names(rv$msi_mapping), function(nm) {
+        m <- rv$msi_mapping[[nm]]
+        tags$div(style="margin-bottom:16px;",
+                 tags$b(paste0("Item: ", nm)),
+                 tags$table(
+                   class="table table-bordered table-sm table-striped",
+                   style="font-size:12px;width:auto;",
+                   tags$thead(tags$tr(
+                     tags$th("Kategori"), tags$th("Frekuensi"), tags$th("Proporsi"),
+                     tags$th("Kum. Prop"), tags$th("Densitas"), tags$th("Z"),
+                     tags$th(tags$b("Nilai MSI"))
+                   )),
+                   tags$tbody(lapply(1:nrow(m), function(i)
+                     tags$tr(
+                       tags$td(m$Kategori[i]),
+                       tags$td(m$Frek[i]),
+                       tags$td(m$Proporsi[i]),
+                       tags$td(m$Kum[i]),
+                       tags$td(m$Densitas[i]),
+                       tags$td(if (is.na(m$Z[i])) "—" else m$Z[i]),
+                       tags$td(tags$b(m$Nilai_MSI[i]))
+                     )
+                   ))
+                 )
+        )
+      })
+    )
   })
   
   # ── UJI ASUMSI ──────────────────────────────────────────
   observeEvent(input$run_kmo, {
     req(rv$clean_data)
     df <- rv$clean_data
-    if (input$use_msi && rv$data_type=="polytomous") df <- msi_transform(df)
     tryCatch({
       kmo_res  <- KMO(df)
       bart_res <- cortest.bartlett(cor(df,use="pairwise.complete.obs"), n=nrow(df))
@@ -622,7 +732,6 @@ server <- function(input, output, session) {
   observeEvent(input$run_scree, {
     req(rv$clean_data)
     df <- rv$clean_data
-    if (input$use_msi && rv$data_type=="polytomous") df <- msi_transform(df)
     tryCatch({
       ev    <- eigen(cor(df,use="pairwise.complete.obs"))$values
       ns    <- min(length(ev),20)
@@ -644,30 +753,135 @@ server <- function(input, output, session) {
     }, error=function(e) showNotification(paste("Error:",e$message),type="error"))
   })
   
-  observeEvent(input$run_li, {
-    req(rv$clean_data)
-    df <- rv$clean_data
+  observeEvent(input$run_q3, {
+    req(rv$clean_data, rv$irt_model)
+    withProgress(message="Menghitung Yen's Q3...", value=0, {
+      tryCatch({
+        df  <- rv$clean_data
+        ni  <- ncol(df)
+        tv  <- fscores(rv$irt_model, method="EAP", full.scores=TRUE)[,1]
+        
+        incProgress(0.3, detail="Menghitung residual item...")
+        # Hitung residual untuk setiap item
+        resid_mat <- matrix(NA, nrow=nrow(df), ncol=ni)
+        colnames(resid_mat) <- colnames(df)
+        for (j in 1:ni) {
+          pg <- tryCatch(probtrace(extract.item(rv$irt_model, j), tv), error=function(e)NULL)
+          if (is.null(pg)) next
+          if (ncol(pg)==2) {
+            expected <- pg[,2]
+          } else {
+            cats <- 0:(ncol(pg)-1)
+            expected <- apply(pg, 1, function(p) sum(cats*p))
+          }
+          resid_mat[,j] <- df[,j] - expected
+        }
+        
+        incProgress(0.4, detail="Menghitung matriks Q3...")
+        # Q3 = korelasi antar residual
+        q3_mat <- cor(resid_mat, use="pairwise.complete.obs")
+        diag(q3_mat) <- NA
+        
+        nms <- colnames(df)
+        
+        # Heatmap Q3
+        output$q3_heatmap <- renderPlotly({
+          plot_ly(z=q3_mat, x=nms, y=nms, type="heatmap",
+                  colorscale=list(c(0,"#2c7bb6"),c(0.5,"#ffffbf"),c(1,"#d7191c")),
+                  zmin=-1, zmax=1,
+                  colorbar=list(title="Q3",len=0.85,thickness=15),
+                  hovertemplate="%{y} × %{x}<br>Q3 = %{z:.3f}<extra></extra>") %>%
+            add_trace(type="scatter", mode="lines",
+                      x=c(min(nms),max(nms)), y=c(min(nms),max(nms)),
+                      line=list(color="rgba(0,0,0,0)"), showlegend=FALSE,
+                      hoverinfo="none") %>%
+            layout(
+              title=list(text=paste0("Yen's Q3 Matrix — Independensi Lokal",
+                                     if(ni>40)" (40 item pertama)"else""),
+                         font=list(size=14,color="#1a2340")),
+              shapes=list(list(type="line",x0=0,x1=1,y0=0.2,y1=0.2,
+                               xref="paper",yref="y",
+                               line=list(color="red",width=1,dash="dash"))),
+              xaxis=list(title="",tickfont=list(size=9),tickangle=-45),
+              yaxis=list(title="",tickfont=list(size=9),autorange="reversed"),
+              margin=list(l=80,r=20,b=100,t=60),autosize=TRUE)
+        })
+        
+        # Ringkasan
+        q3_vals <- q3_mat[upper.tri(q3_mat)]
+        q3_vals <- q3_vals[!is.na(q3_vals)]
+        n_viol  <- sum(q3_vals > 0.2, na.rm=TRUE)
+        n_total <- length(q3_vals)
+        
+        output$q3_summary_ui <- renderUI({
+          tagList(
+            valueBox(round(max(q3_vals,na.rm=TRUE),3),"Q3 Maksimum",
+                     icon=icon("arrow-up"),color=if(max(q3_vals,na.rm=TRUE)<=0.2)"green"else"red",width=12),
+            valueBox(n_viol,paste0("Pasangan Q3 > 0.2 (dari ",n_total,")"),
+                     icon=icon("exclamation-triangle"),color=if(n_viol==0)"green"else"orange",width=12),
+            tags$div(class=if(n_viol==0)"info-callout"else"warn-callout",
+                     if(n_viol==0)
+                       "✅ Semua pasangan item Q3 ≤ 0.2. Independensi lokal TERPENUHI."
+                     else
+                       paste0("⚠️ ",n_viol," pasangan item Q3 > 0.2. Periksa tabel pelanggaran."))
+          )
+        })
+        
+        # Tabel pelanggaran
+        viol_rows <- which(q3_mat > 0.2, arr.ind=TRUE)
+        viol_rows <- viol_rows[viol_rows[,1] < viol_rows[,2], , drop=FALSE]
+        if (nrow(viol_rows) > 0) {
+          viol_df <- data.frame(
+            Item_i = nms[viol_rows[,1]],
+            Item_j = nms[viol_rows[,2]],
+            Q3     = round(q3_mat[viol_rows], 3),
+            Status = "⚠️ Langgar LI"
+          )
+          viol_df <- viol_df[order(-viol_df$Q3),]
+        } else {
+          viol_df <- data.frame(Item_i=character(),Item_j=character(),Q3=numeric(),Status=character())
+        }
+        output$q3_violation_table <- renderDT({
+          datatable(viol_df,
+                    options=list(scrollX=TRUE,pageLength=10,dom="t"),
+                    class="table-bordered table-sm",rownames=FALSE,escape=FALSE,
+                    caption="Pasangan item dengan Q3 > 0.2")
+        })
+        
+        incProgress(0.3, detail="Selesai!")
+        showNotification(paste0("✅ Q3 selesai! ",n_viol," dari ",n_total,
+                                " pasangan Q3 > 0.2."),type="message",duration=5)
+      }, error=function(e)
+        showNotification(paste("❌ Error Q3:",e$message),type="error"))
+    })
+  })
+  
+  # ── MSI APPLY ──────────────────────────────────────────
+  observeEvent(input$apply_msi, {
+    req(rv$raw_data)
+    if (rv$data_type != "politomus") {
+      showNotification("⚠️ MSI hanya berlaku untuk data politomus.",type="warning"); return()
+    }
     tryCatch({
-      ns  <- min(ncol(df),40)
-      df2 <- df[,1:ns,drop=FALSE]
-      cm  <- cor(df2,use="pairwise.complete.obs")
-      nms <- colnames(df2)
-      output$corr_heatmap <- renderPlotly({
-        plot_ly(z=cm,x=nms,y=nms,type="heatmap",
-                colorscale=list(c(0,"#2c7bb6"),c(0.5,"#ffffbf"),c(1,"#d7191c")),
-                zmin=-1,zmax=1,
-                colorbar=list(title="r",len=0.85,thickness=15),
-                hovertemplate="%{y} × %{x}<br>r = %{z:.3f}<extra></extra>") %>%
-          layout(
-            title=list(text=paste0("Inter-Item Correlation Matrix",
-                                   if(ncol(df)>40)" (40 item pertama)"else""),
-                       font=list(size=14,color="#1a2340")),
-            xaxis=list(title="",tickfont=list(size=9),tickangle=-45),
-            yaxis=list(title="",tickfont=list(size=9),autorange="reversed"),
-            margin=list(l=80,r=20,b=100,t=60),autosize=TRUE)
-      })
-      if (ncol(df)>40) showNotification("Hanya 40 item pertama.",type="warning")
-    }, error=function(e) showNotification(paste("Error:",e$message),type="error"))
+      sm <- input$msi_min; sx <- input$msi_max
+      if (sx <= sm) {
+        showNotification("⚠️ Skala maksimal harus lebih besar dari skala minimal.",type="error"); return()
+      }
+      msi_res <- msi_transform(rv$raw_data, scale_min=sm, scale_max=sx)
+      rv$clean_data    <- msi_res$data
+      rv$msi_mapping   <- msi_res$mapping
+      rv$msi_applied   <- TRUE
+      showNotification(paste0("✅ MSI diterapkan! Skala: ",sm," – ",sx),type="message",duration=4)
+    }, error=function(e) showNotification(paste("❌ MSI Error:",e$message),type="error"))
+  })
+  
+  # Reset MSI jika checkbox dilepas
+  observeEvent(input$use_msi, {
+    if (!input$use_msi) {
+      rv$clean_data  <- rv$raw_data
+      rv$msi_applied <- FALSE
+      rv$msi_mapping <- NULL
+    }
   })
   
   output$assumption_summary <- renderUI({
@@ -677,15 +891,15 @@ server <- function(input, output, session) {
              tags$b("Panduan Keputusan Asumsi:"),tags$br(),
              "1. ",tags$b("KMO ≥ 0.6 & Bartlett p<0.05:")," → lanjutkan analisis.",tags$br(),
              "2. ",tags$b("Scree Plot — EV₁>>EV₂:")," → unidimensionalitas terpenuhi.",tags$br(),
-             "3. ",tags$b("Heatmap warna oranye muda dominan:")," → LI kemungkinan terpenuhi.",tags$br(),
-             "4. ",tags$b("Konfirmasi LI:")," gunakan residual korelasi dari model mirt setelah estimasi.")
+             "3. ",tags$b("Yen's Q3 ≤ 0.2 (semua pasangan item):")," → independensi lokal terpenuhi.",tags$br(),
+             "4. ",tags$b("Catatan:")," Jalankan estimasi IRT terlebih dahulu, lalu hitung Q3 untuk hasil yang akurat.")
   })
   
   # ── ESTIMASI IRT ────────────────────────────────────────
   observeEvent(input$run_irt, {
     req(rv$clean_data)
     df <- rv$clean_data
-    if (input$use_msi && rv$data_type=="polytomous") df <- msi_transform(df)
+    # MSI sudah diterapkan via tombol "Terapkan MSI"; tidak perlu transform ulang
     withProgress(message="Estimasi IRT...", value=0, {
       tryCatch({
         incProgress(0.2,detail="Membangun model...")
