@@ -15,5 +15,5 @@ remote_version <- sub("Version: ", "", remote_version_line)
       stop("Versi Anda sudah usang.\nSilakan update dulu:\nremotes::install_github('lanraproject/IRANV1')")
     }
     
-  }, silent = TRUE)
+  }, silent = FALSE)
 }
