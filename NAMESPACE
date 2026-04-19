@@ -1,1 +1,2 @@
 export(run_app)
+export(check_update)
