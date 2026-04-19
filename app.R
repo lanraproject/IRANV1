@@ -292,7 +292,7 @@ ui <- dashboardPage(
                 )
               ),
               fluidRow(
-                box(title="🔗 Uji Local Independence — Yen's Q3 Statistic",
+                box(title="🔗 Uji Local Independence - Yen's Q3 Statistic",
                     status="warning", solidHeader=TRUE, width=12,
                     tags$div(class="info-callout",
                              tags$b("Statistik Yen's Q3:"),tags$br(),
