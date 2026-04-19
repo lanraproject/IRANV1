@@ -1,0 +1,11 @@
+Package: IRANV1
+Type: Package
+Title: Aplikasi Shiny IRAN
+Version: 0.1.0
+Author: lanra
+  Description: Analisis IRT.
+Depends: R (>= 4.0)
+Imports: shiny
+License: MIT
+Encoding: UTF-8
+LazyData: true
