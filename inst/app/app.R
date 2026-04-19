@@ -1,3 +1,7 @@
+run_app <- function() {
+  
+  check_update()
+
 required_packages <- c(
   "shiny","shinydashboard","shinyjs","DT","readxl",
   "dplyr","ggplot2","mirt","psych",
