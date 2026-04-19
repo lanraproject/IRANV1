@@ -1,7 +1,7 @@
 Package: IRANV1
 Type: Package
 Title: Coba Deh Dipakai Buat Analisis IRT
-Version: 0.1.4
+Version: 0.1.5
 Author: lanra
   Description: Analisis IRT.
 Depends: R (>= 4.0)
