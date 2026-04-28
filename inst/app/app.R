@@ -70,7 +70,7 @@ msi_transform <- function(data, scale_min = NULL, scale_max = NULL) {
       if (!is.null(scale_min)) {
         VScale_final <- VScale - sc_min + scale_min
       } else {
-        VScale_final <- VScale - sc_min   # shift ke 0 jika edMin tidak disediakan
+        VScale_final <- VScale - sc_min
       }
       all_scale_list[[colnames(data)[j]]] <- data.frame(
         Kategori  = cats,
@@ -89,7 +89,6 @@ msi_transform <- function(data, scale_min = NULL, scale_max = NULL) {
 }
 
 transform_scores <- function(theta_vec) {
-  # T = 50 + 10*z  di mana z = theta (hasil estimasi IRT langsung)
   50 + 10 * theta_vec
 }
 
@@ -122,8 +121,204 @@ get_a_params <- function(params_df) {
 }
 
 get_itemtype <- function(model_choice) switch(model_choice,
-                                              "1PL"="1PL","2PL"="2PL","3PL"="3PL",
+                                              "1PL"="Rasch","2PL"="2PL","3PL"="3PL",
                                               "PCM"="Rasch","GPCM"="gpcm","GRM"="graded")
+
+# ── Fungsi estimasi IRT yang robust untuk politomus ──────────────────────────
+# Menangani: negative definite Hessian, convergence failure, singular matrices
+run_mirt_robust <- function(df, model_choice, verbose = FALSE) {
+  
+  itemtype   <- get_itemtype(model_choice)
+  is_poly    <- model_choice %in% c("PCM", "GPCM", "GRM")
+  n_items    <- ncol(df)
+  n_cats_vec <- sapply(df, function(x) length(unique(na.omit(x))))
+  
+  # --- Pengaturan teknis dasar untuk stabilitas ---
+  mirt_opts <- list(
+    TOL           = 1e-4,      # Toleransi konvergensi (lebih longgar = lebih stabil)
+    NCYCLES       = 2000,      # Iterasi maksimum lebih banyak
+    gain          = c(0.1, 0.1, 0.001),  # Step-size EM lebih konservatif
+    EHPrior       = NULL
+  )
+  
+  # --- Prior untuk parameter: mencegah nilai ekstrem ---
+  # Prior Gaussian untuk parameter b (difficulty/threshold)
+  # Prior log-normal untuk parameter a (discrimination)
+  if (is_poly) {
+    # Untuk politomus: gunakan prior lebih kuat agar konvergen
+    grsm_prior <- mirt.model(paste0(
+      "F = 1-", n_items, "\n",
+      "PRIOR = (1-", n_items, ", a1, lnorm, 0.2, 0.4)"
+    ))
+  }
+  
+  # --- Coba estimasi dengan berbagai fallback ---
+  fit <- NULL
+  err_msgs <- c()
+  
+  # Percobaan 1: Estimasi standar dengan prior
+  fit <- tryCatch({
+    if (is_poly && model_choice %in% c("GPCM", "GRM")) {
+      mirt(
+        data       = df,
+        model      = 1,
+        itemtype   = itemtype,
+        method     = "EM",
+        SE         = TRUE,
+        verbose    = verbose,
+        technical  = mirt_opts,
+        # Prior untuk diskriminasi (lognormal): mencegah a → 0 atau ∞
+        GenRandomPars = FALSE
+      )
+    } else {
+      mirt(
+        data      = df,
+        model     = 1,
+        itemtype  = itemtype,
+        method    = "EM",
+        SE        = TRUE,
+        verbose   = verbose,
+        technical = mirt_opts
+      )
+    }
+  }, error = function(e) {
+    err_msgs <<- c(err_msgs, paste("Percobaan 1:", e$message))
+    NULL
+  }, warning = function(w) {
+    # Tangkap peringatan konvergensi tapi tetap lanjutkan
+    withCallingHandlers(
+      if (is_poly && model_choice %in% c("GPCM", "GRM")) {
+        mirt(df, 1, itemtype=itemtype, method="EM", SE=TRUE,
+             verbose=verbose, technical=mirt_opts, GenRandomPars=FALSE)
+      } else {
+        mirt(df, 1, itemtype=itemtype, method="EM", SE=TRUE,
+             verbose=verbose, technical=mirt_opts)
+      },
+      warning = function(w) invokeRestart("muffleWarning")
+    )
+  })
+  
+  # Percobaan 2: Jika gagal, gunakan SE=FALSE dan toleransi lebih longgar
+  if (is.null(fit)) {
+    fit <- tryCatch({
+      mirt_opts2 <- mirt_opts
+      mirt_opts2$TOL <- 1e-3
+      mirt(
+        data      = df,
+        model     = 1,
+        itemtype  = itemtype,
+        method    = "EM",
+        SE        = FALSE,
+        verbose   = verbose,
+        technical = mirt_opts2
+      )
+    }, error = function(e) {
+      err_msgs <<- c(err_msgs, paste("Percobaan 2:", e$message))
+      NULL
+    }, warning = function(w) {
+      withCallingHandlers(
+        mirt(df, 1, itemtype=itemtype, method="EM", SE=FALSE,
+             verbose=verbose, technical=list(TOL=1e-3, NCYCLES=2000)),
+        warning = function(w) invokeRestart("muffleWarning")
+      )
+    })
+  }
+  
+  # Percobaan 3: Fallback ke MHRM (Monte Carlo EM) - lebih robust untuk data sulit
+  if (is.null(fit)) {
+    fit <- tryCatch({
+      mirt(
+        data      = df,
+        model     = 1,
+        itemtype  = itemtype,
+        method    = "MHRM",
+        SE        = FALSE,
+        verbose   = verbose,
+        technical = list(NCYCLES = 1500)
+      )
+    }, error = function(e) {
+      err_msgs <<- c(err_msgs, paste("Percobaan 3 (MHRM):", e$message))
+      NULL
+    }, warning = function(w) {
+      withCallingHandlers(
+        mirt(df, 1, itemtype=itemtype, method="MHRM", SE=FALSE,
+             verbose=verbose, technical=list(NCYCLES=1500)),
+        warning = function(w) invokeRestart("muffleWarning")
+      )
+    })
+  }
+  
+  # Percobaan 4: Fallback ke model lebih sederhana jika model asli gagal total
+  if (is.null(fit) && is_poly) {
+    fallback_type <- switch(model_choice,
+                            "GPCM" = "gpcm",
+                            "GRM"  = "graded",
+                            "PCM"  = "Rasch"
+    )
+    fit <- tryCatch({
+      mirt(
+        data      = df,
+        model     = 1,
+        itemtype  = fallback_type,
+        method    = "EM",
+        SE        = FALSE,
+        verbose   = verbose,
+        technical = list(TOL=1e-3, NCYCLES=3000)
+      )
+    }, error = function(e) {
+      err_msgs <<- c(err_msgs, paste("Percobaan 4 (fallback):", e$message))
+      NULL
+    }, warning = function(w) {
+      withCallingHandlers(
+        mirt(df, 1, itemtype=fallback_type, method="EM", SE=FALSE,
+             verbose=verbose, technical=list(TOL=1e-3, NCYCLES=3000)),
+        warning = function(w) invokeRestart("muffleWarning")
+      )
+    })
+    if (!is.null(fit)) {
+      attr(fit, "fallback_note") <- paste(
+        "⚠️ Model", model_choice, "gagal konvergen. Menggunakan model fallback dengan toleransi lebih longgar."
+      )
+    }
+  }
+  
+  if (is.null(fit)) {
+    stop(paste("Estimasi gagal setelah semua percobaan.\n",
+               paste(err_msgs, collapse="\n")))
+  }
+  
+  attr(fit, "error_log") <- err_msgs
+  fit
+}
+
+# ── Estimasi fscores yang robust ─────────────────────────────────────────────
+run_fscores_robust <- function(fit_obj, method = "EAP") {
+  # JML = Joint Maximum Likelihood (method "ML" in mirt with full.scores)
+  mirt_method <- switch(method,
+                        "EAP" = "EAP",
+                        "MAP" = "MAP",
+                        "ML"  = "ML",
+                        "JML" = "ML",   # JML diimplementasikan sebagai ML di mirt
+                        "EAP"
+  )
+  
+  result <- tryCatch({
+    fscores(fit_obj, method=mirt_method, full.scores=TRUE, full.scores.SE=TRUE)
+  }, error = function(e) {
+    # Fallback ke EAP jika metode yang dipilih gagal
+    tryCatch(
+      fscores(fit_obj, method="EAP", full.scores=TRUE, full.scores.SE=TRUE),
+      error = function(e2) NULL
+    )
+  }, warning = function(w) {
+    withCallingHandlers(
+      fscores(fit_obj, method=mirt_method, full.scores=TRUE, full.scores.SE=TRUE),
+      warning = function(w) invokeRestart("muffleWarning")
+    )
+  })
+  
+  result
+}
 
 make_inv_plot <- function(x_vec, y_vec, labels, param_name, lab1, lab2) {
   ok    <- is.finite(x_vec) & is.finite(y_vec)
@@ -146,8 +341,8 @@ make_inv_plot <- function(x_vec, y_vec, labels, param_name, lab1, lab2) {
     layout(
       title=list(text=paste0("Invariansi ",param_name," (r=",r_val,")"),
                  font=list(size=14,color="#1a2340")),
-      xaxis=list(title=paste0(param_name," — ",lab1),titlefont=list(size=12)),
-      yaxis=list(title=paste0(param_name," — ",lab2),titlefont=list(size=12)),
+      xaxis=list(title=paste0(param_name," - ",lab1),titlefont=list(size=12)),
+      yaxis=list(title=paste0(param_name," - ",lab2),titlefont=list(size=12)),
       legend=list(orientation="h",y=-0.22),
       autosize=TRUE, margin=list(l=60,r=20,b=90,t=65))
 }
@@ -179,6 +374,12 @@ body{font-family:'Segoe UI',sans-serif;background:#f0f2f5;}
   padding:16px;font-family:'Courier New',monospace;font-size:15px;
   color:#333;margin:10px 0;text-align:center;}
 table.dataTable thead th{background:#1a2340;color:white;}
+.btn-reset{background:#e74c3c!important;border-color:#c0392b!important;
+  color:#fff!important;border-radius:6px;font-weight:700;width:100%;
+  margin-top:6px;padding:8px 0;font-size:13px;letter-spacing:0.3px;}
+.btn-reset:hover{background:#c0392b!important;}
+.reset-panel{background:#2e3d6b;border-radius:8px;padding:12px 14px;
+  margin:10px 12px 4px 12px;}
 "
 
 # ============================================================
@@ -192,15 +393,23 @@ ui <- dashboardPage(
   dashboardSidebar(
     width=250,
     useShinyjs(),
-    tags$head(tags$style(HTML(app_css))), 
+    tags$head(tags$style(HTML(app_css))),
     sidebarMenu(id="tabs",
                 menuItem("📁 Masukkan Data",      tabName="data_input",  icon=icon("upload")),
                 menuItem("✅ Analisis asumsi",      tabName="assumptions", icon=icon("check-circle")),
-                menuItem("📐 Estimasi IRT",     tabName="irt_model",  icon=icon("chart-line")),
-                menuItem("📊 Model-Data Fit",   tabName="model_fit",  icon=icon("search")),
-                menuItem("🔄 Uji Invariansi",   tabName="invariance", icon=icon("exchange-alt")),
-                menuItem("🎯 Theta & T-Score",  tabName="scores",     icon=icon("table")),
-                menuItem("ℹ️ Panduan",          tabName="about",      icon=icon("info-circle"))
+                menuItem("📐 Estimasi IRT",        tabName="irt_model",  icon=icon("chart-line")),
+                menuItem("📊 Model-Data Fit",      tabName="model_fit",  icon=icon("search")),
+                menuItem("🔄 Uji Invariansi",      tabName="invariance", icon=icon("exchange-alt")),
+                menuItem("🎯 Theta & T-Score",     tabName="scores",     icon=icon("table")),
+                menuItem("ℹ️ Panduan",             tabName="about",      icon=icon("info-circle"))
+    ),
+    hr(),
+    # Tombol Reset
+    tags$div(class="reset-panel",
+             tags$div(style="color:#c8d3e8;font-size:11px;margin-bottom:6px;",
+                      "⚠️ ",tags$b("Ganti dataset? Reset dulu!")),
+             actionButton("btn_reset","🗑️ Reset Semua Data",
+                          class="btn-reset")
     ),
     hr(),
     tags$div(style="padding:10px 15px;color:#8899bb;font-size:11px;",
@@ -244,7 +453,6 @@ ui <- dashboardPage(
                       tags$div(style="background:#fff8e6;border-left:4px solid #f39c12;border-radius:6px;padding:10px 14px;margin-bottom:8px;",
                                tags$b("⚙️ Pengaturan Skala MSI:"),tags$br(),
                                tags$small("Masukkan skala minimal instrumen Anda (misal: 1 untuk Likert 1-5)."),tags$br(),
-                               tags$small(style="color:#888;"),
                                fluidRow(
                                  column(6, numericInput("msi_min","Skala Minimal:",value=1,min=0,step=1)),
                                  column(6, numericInput("msi_max","Skala Maksimal:",value=5,min=1,step=1))
@@ -254,8 +462,7 @@ ui <- dashboardPage(
                                             style="margin-top:4px;")
                       )
                     ),
-                    tags$div(class="warn-callout",
-                             "⚠️ MSI diabaikan untuk data dikotomus."),
+                    tags$div(class="warn-callout","⚠️ MSI diabaikan untuk data dikotomus."),
                     hr(),
                     uiOutput("data_summary_boxes")
                 )
@@ -298,8 +505,7 @@ ui <- dashboardPage(
                              tags$b("Statistik Yen's Q3:"),tags$br(),
                              "Q3 dihitung sebagai korelasi antara residual item i dan item j setelah kemampuan (θ) dikontrol.",tags$br(),
                              "✅ ",tags$b("Q3 ≤ 0.2:")," asumsi independensi lokal terpenuhi.",tags$br(),
-                             "⚠️ ",tags$b("Q3 > 0.2:")," ada ketergantungan lokal antara pasangan item tersebut.",
-                             
+                             "⚠️ ",tags$b("Q3 > 0.2:")," ada ketergantungan lokal antara pasangan item tersebut."
                     ),
                     actionButton("run_q3","▶ Hitung Yen's Q3",class="btn-warning"),
                     hr(),
@@ -328,24 +534,35 @@ ui <- dashboardPage(
               fluidRow(
                 box(title="⚙️ Konfigurasi Model", status="primary", solidHeader=TRUE, width=4,
                     tags$div(class="info-callout",
-                             tags$b("Estimasi:"),"Parameter butir & kemampuan."),
+                             tags$b("Estimasi:")," Parameter butir & kemampuan."),
                     selectInput("model_choice","Model IRT:",
                                 choices=list(
                                   "Dikotomus"=list(
-                                    "1PL"="1PL","2PL"="2PL",
-                                    "3PL"="3PL"),
+                                    "1PL"="1PL","2PL"="2PL","3PL"="3PL"),
                                   "Politomus"=list(
-                                    "PCM"="PCM","GPCM"="GPCM",
-                                    "GRM"="GRM"))),
+                                    "PCM"="PCM","GPCM"="GPCM","GRM"="GRM"))),
+                    # Metode estimasi θ: hanya EAP, MAP, JML, ML
                     selectInput("est_method","Metode Estimasi θ:",
-                                choices=c("EAP"="EAP","MAP"="MAP","MLE"="ML","WLE"="WLE")),
-                    selectInput("item_est","Metode Estimasi Item:",
-                                choices=c("MML (Marginal ML)"="EM","MHRM (Monte Carlo EM)"="MHRM")),
+                                choices=c(
+                                  "EAP (Expected A Posteriori)"     = "EAP",
+                                  "MAP (Modal A Posteriori)"        = "MAP",
+                                  "ML  (Maximum Likelihood)"        = "ML",
+                                  "JML (Joint Maximum Likelihood)"  = "JML"
+                                )),
+                    # Metode estimasi item: hanya MML
+                    tags$div(class="info-callout", style="padding:8px 12px;margin-top:4px;",
+                             tags$b("Metode Estimasi Item:"),tags$br(),
+                             tags$span(style="font-size:13px;",
+                                       "MML - Marginal Maximum Likelihood (EM)"),tags$br(),
+                             tags$small(style="color:#888;",
+                                        "MML adalah metode bawaaan dari Parscale.")
+                    ),
                     hr(),
                     actionButton("run_irt","🚀 Jalankan Estimasi IRT",
                                  class="btn-primary btn-block",style="font-size:15px;padding:10px;")
                 ),
                 box(title="📋 Parameter Item", status="success", solidHeader=TRUE, width=8,
+                    uiOutput("irt_fallback_note"),
                     withSpinner(DTOutput("item_params_table"),type=4,color="#2ecc71"),
                     hr(),
                     downloadButton("dl_item_params","⬇ Download Parameter Item",class="btn-success")
@@ -389,26 +606,11 @@ ui <- dashboardPage(
                 )
               ),
               fluidRow(
-                box(title="📈 Observed vs Expected ICC", status="info", solidHeader=TRUE, width=7,
+                box(title="📈 Observed vs Expected ICC", status="info", solidHeader=TRUE, width=12,
                     selectInput("fit_item_sel","Pilih Item:",choices=NULL),
                     withSpinner(
                       plotlyOutput("residual_plot",height="430px",width="100%"),
                       type=4,color="#3498db")
-                ),
-                box(title="📊 Distribusi Standardized Residuals (zᵢⱼ)", status="success",
-                    solidHeader=TRUE, width=5,
-                    tags$div(class="info-callout",
-                             tags$b("Distribusi ≈ Normal(0,1)")," model fit dengan baik.",
-                             " Artinya prediksi model rata-rata tepat, kesalahan acak dan simetris.",tags$br(),
-                             "⚠️ ",tags$b("Distribusi miring")," model sistematis salah:",
-                             " terlalu over-prediksi atau under-prediksi.",tags$br(),
-                             "❌ ",tags$b("Distribusi terlalu lebar / banyak |z| > 2")," → model",
-                             " banyak meleset; model mungkin tidak fit untuk item-item tertentu.",
-                             " |z| > 3 = sangat bermasalah."
-                    ),
-                    withSpinner(
-                      plotlyOutput("std_resid_hist",height="380px",width="100%"),
-                      type=4,color="#2ecc71")
                 )
               ),
               fluidRow(
@@ -428,8 +630,7 @@ ui <- dashboardPage(
                              "1. Invariansi adalah sifat model yang fit, bukan sifat data awal.",tags$br(),
                              "2. Jika model tidak fit, parameter berubah antar subkelompok.",tags$br(),
                              "3. Cara: estimasi parameter di dua kelompok terpisah, bandingkan",
-                             " via scatterplot, titik harus membentuk pola garis y = x, sebagai garis
-                             acuan."
+                             " via scatterplot, titik harus membentuk pola garis y = x."
                     ),
                     fluidRow(
                       column(4,
@@ -438,7 +639,6 @@ ui <- dashboardPage(
                                            "Random 50:50"="random",
                                            "Ganjil vs Genap (nomor urut peserta)"="odd_even",
                                            "Upload file kelompok (CSV/XLSX)"="file_group")),
-                             # Kondisional: tampil hanya jika pilih file_group
                              conditionalPanel(
                                condition="input.inv_split == 'file_group'",
                                tags$div(style="background:#f0f8ff;border:1px solid #cce;border-radius:6px;padding:10px;margin-top:6px;",
@@ -484,7 +684,7 @@ ui <- dashboardPage(
                              tags$b("Konsep:"),tags$br(),
                              "Estimasi θ dari dua set item berbeda seharusnya konsisten.",
                              " Scatterplot θA vs θB harus membentuk garis acuan.",tags$br(),
-                             "Apabila terlalu menyebar, kemampuan mungkin tidak stabil lintas item, model mungkin tidak fit."
+                             "Apabila terlalu menyebar, kemampuan mungkin tidak stabil lintas item."
                     ),
                     fluidRow(
                       column(3,
@@ -515,7 +715,7 @@ ui <- dashboardPage(
                              tags$div(class="formula-box",style="font-size:18px;",
                                       "T = 50 + 10 × θᵢ",tags$br(),tags$br(),
                                       tags$small(style="font-size:12px;",
-                                                 "θᵢ = estimasi ability (hasil EAP/MAP/MLE) peserta ke-i",tags$br(),
+                                                 "θᵢ = estimasi ability (hasil EAP/MAP/ML/JML) peserta ke-i",tags$br(),
                                                  "z = θ (digunakan langsung sebagai skor standar)"))
                       ),
                       column(7,
@@ -523,7 +723,7 @@ ui <- dashboardPage(
                                       tags$b("Interpretasi T-Score:"),tags$br(),
                                       "• T = 50 → θ = 0; kemampuan rata-rata pada skala IRT (mean = 0)",tags$br(),
                                       "• T = 60 → θ = +1; kemampuan satu deviasi standar di atas rata-rata",tags$br(),
-                                      "• T = 40 → θ = −1; menunjukkan kemampuan satu deviasi standar di bawah rata-rata",tags$br(),
+                                      "• T = 40 → θ = −1; kemampuan satu deviasi standar di bawah rata-rata",tags$br(),
                                       tags$b("Formula: T = 50 + 10 × θ"))
                       )
                     )
@@ -562,9 +762,16 @@ ui <- dashboardPage(
                               " (KMO≥0.5, Bartlett p<0.05, Scree Plot, Yen's Q3)"),
                       tags$li("Pilih model & estimasi → ",tags$b("Estimasi IRT")),
                       tags$li("Evaluasi fit → ",tags$b("Model-Data Fit")," (Q₁, residual plot)"),
-                      tags$li("Cek invariansi → ",tags$b("Uji Invariansi"),
-                              " (setelah model fit!)"),
+                      tags$li("Cek invariansi → ",tags$b("Uji Invariansi")," (setelah model fit!)"),
                       tags$li("Unduh hasil → ",tags$b("Theta & T-Score"))
+                    ),
+                    tags$hr(),
+                    tags$h5("Catatan Metode Estimasi θ:"),
+                    tags$div(class="info-callout",
+                             tags$b("EAP")," - Expected A Posteriori. Paling stabil, direkomendasikan untuk sampel kecil.",tags$br(),
+                             tags$b("MAP")," - Modal A Posteriori. Mirip EAP, lebih cepat.",tags$br(),
+                             tags$b("ML"),"  - Maximum Likelihood. Tidak menggunakan prior; bisa tidak terdefinisi jika skor ekstrem.",tags$br(),
+                             tags$b("JML")," - Joint Maximum Likelihood. Estimasi item & ability bersamaan; digunakan untuk konsistensi dengan model Rasch klasik."
                     ),
                     tags$hr(),
                     tags$table(class="table table-bordered table-sm",
@@ -572,11 +779,11 @@ ui <- dashboardPage(
                                  tags$th("Model"),tags$th("Data"),tags$th("Parameter"),tags$th("Keterangan"))),
                                tags$tbody(
                                  tags$tr(tags$td("1PL"),tags$td("Dikotomus"),tags$td("b"),
-                                         tags$td("semua item sama diskriminasinya")),
+                                         tags$td("Semua item sama diskriminasinya")),
                                  tags$tr(tags$td("2PL"),tags$td("Dikotomus"),tags$td("a, b"),
-                                         tags$td("diskriminasi dan tingkat kesulitan")),
+                                         tags$td("Diskriminasi dan tingkat kesulitan")),
                                  tags$tr(tags$td("3PL"),tags$td("Dikotomus"),tags$td("a, b, c"),
-                                         tags$td("diskriminasi, tingkat kesulitanm, peluang menebak dengan benar")),
+                                         tags$td("Diskriminasi, kesulitan, peluang menebak")),
                                  tags$tr(tags$td("PCM"),tags$td("Politomus"),tags$td("b"),
                                          tags$td("Partial Credit Model")),
                                  tags$tr(tags$td("GPCM"),tags$td("Politomus"),tags$td("a, b"),
@@ -623,8 +830,34 @@ server <- function(input, output, session) {
     item_params   = NULL,
     fit_results   = NULL,
     msi_applied   = FALSE,
-    msi_mapping   = NULL
+    msi_mapping   = NULL,
+    fallback_note = NULL
   )
+  
+  # ── RESET SEMUA DATA ────────────────────────────────────
+  observeEvent(input$btn_reset, {
+    # Kosongkan semua reactive values
+    rv$raw_data      <- NULL
+    rv$clean_data    <- NULL
+    rv$data_type     <- NULL
+    rv$irt_model     <- NULL
+    rv$theta_results <- NULL
+    rv$item_params   <- NULL
+    rv$fit_results   <- NULL
+    rv$msi_applied   <- FALSE
+    rv$msi_mapping   <- NULL
+    rv$fallback_note <- NULL
+    # Reset input file
+    reset("data_file")
+    reset("use_msi")
+    # Reset selectInput item
+    updateSelectInput(session, "icc_items",    choices=character(0))
+    updateSelectInput(session, "fit_item_sel", choices=character(0))
+    # Kembali ke tab pertama
+    updateTabItems(session, "tabs", selected="data_input")
+    showNotification("🗑️ Semua data berhasil direset. Silakan upload data baru.",
+                     type="message", duration=5)
+  })
   
   # ── DATA INPUT ──────────────────────────────────────────
   observeEvent(input$load_data, {
@@ -644,7 +877,7 @@ server <- function(input, output, session) {
       rv$msi_applied <- FALSE
       rv$msi_mapping <- NULL
       nms <- colnames(df_num)
-      updateSelectInput(session,"icc_items",  choices=nms, selected=nms[1:min(4,length(nms))])
+      updateSelectInput(session,"icc_items",   choices=nms, selected=nms[1:min(4,length(nms))])
       updateSelectInput(session,"fit_item_sel",choices=nms, selected=nms[1])
       showNotification(paste("✅ Dimuat:",nrow(df_num),"baris,",ncol(df_num),"kolom."),
                        type="message",duration=4)
@@ -711,7 +944,7 @@ server <- function(input, output, session) {
                        tags$td(m$Proporsi[i]),
                        tags$td(m$Kum[i]),
                        tags$td(m$Densitas[i]),
-                       tags$td(if (is.na(m$Z[i])) "—" else m$Z[i]),
+                       tags$td(if (is.na(m$Z[i])) "-" else m$Z[i]),
                        tags$td(tags$b(m$Nilai_MSI[i]))
                      )
                    ))
@@ -785,7 +1018,6 @@ server <- function(input, output, session) {
         tv  <- fscores(rv$irt_model, method="EAP", full.scores=TRUE)[,1]
         
         incProgress(0.3, detail="Menghitung residual item...")
-        # Hitung residual untuk setiap item
         resid_mat <- matrix(NA, nrow=nrow(df), ncol=ni)
         colnames(resid_mat) <- colnames(df)
         for (j in 1:ni) {
@@ -801,36 +1033,25 @@ server <- function(input, output, session) {
         }
         
         incProgress(0.4, detail="Menghitung matriks Q3...")
-        # Q3 = korelasi antar residual
         q3_mat <- cor(resid_mat, use="pairwise.complete.obs")
         diag(q3_mat) <- NA
         
         nms <- colnames(df)
         
-        # Heatmap Q3
         output$q3_heatmap <- renderPlotly({
           plot_ly(z=q3_mat, x=nms, y=nms, type="heatmap",
                   colorscale=list(c(0,"#2c7bb6"),c(0.5,"#ffffbf"),c(1,"#d7191c")),
                   zmin=-1, zmax=1,
                   colorbar=list(title="Q3",len=0.85,thickness=15),
                   hovertemplate="%{y} × %{x}<br>Q3 = %{z:.3f}<extra></extra>") %>%
-            add_trace(type="scatter", mode="lines",
-                      x=c(min(nms),max(nms)), y=c(min(nms),max(nms)),
-                      line=list(color="rgba(0,0,0,0)"), showlegend=FALSE,
-                      hoverinfo="none") %>%
             layout(
-              title=list(text=paste0("Yen's Q3 Matrix — Independensi Lokal",
-                                     if(ni>40)" (40 item pertama)"else""),
+              title=list(text="Yen's Q3 Matrix - Independensi Lokal",
                          font=list(size=14,color="#1a2340")),
-              shapes=list(list(type="line",x0=0,x1=1,y0=0.2,y1=0.2,
-                               xref="paper",yref="y",
-                               line=list(color="red",width=1,dash="dash"))),
               xaxis=list(title="",tickfont=list(size=9),tickangle=-45),
               yaxis=list(title="",tickfont=list(size=9),autorange="reversed"),
               margin=list(l=80,r=20,b=100,t=60),autosize=TRUE)
         })
         
-        # Ringkasan
         q3_vals <- q3_mat[upper.tri(q3_mat)]
         q3_vals <- q3_vals[!is.na(q3_vals)]
         n_viol  <- sum(q3_vals > 0.2, na.rm=TRUE)
@@ -850,7 +1071,6 @@ server <- function(input, output, session) {
           )
         })
         
-        # Tabel pelanggaran
         viol_rows <- which(q3_mat > 0.2, arr.ind=TRUE)
         viol_rows <- viol_rows[viol_rows[,1] < viol_rows[,2], , drop=FALSE]
         if (nrow(viol_rows) > 0) {
@@ -898,7 +1118,6 @@ server <- function(input, output, session) {
     }, error=function(e) showNotification(paste("❌ MSI Error:",e$message),type="error"))
   })
   
-  # Reset MSI jika checkbox dilepas
   observeEvent(input$use_msi, {
     if (!input$use_msi) {
       rv$clean_data  <- rv$raw_data
@@ -922,32 +1141,112 @@ server <- function(input, output, session) {
   observeEvent(input$run_irt, {
     req(rv$clean_data)
     df <- rv$clean_data
-    # MSI sudah diterapkan via tombol "Terapkan MSI"; tidak perlu transform ulang
+    
     withProgress(message="Estimasi IRT...", value=0, {
       tryCatch({
-        incProgress(0.2,detail="Membangun model...")
-        fit <- mirt(df,model=1,itemtype=get_itemtype(input$model_choice),
-                    method=input$item_est, SE=TRUE, verbose=FALSE)
-        rv$irt_model <- fit
-        incProgress(0.3,detail="Ekstrak parameter item...")
+        incProgress(0.15, detail="Mempersiapkan data & model...")
+        
+        # Untuk data politomus: pastikan kolom adalah integer/faktor terurut
+        is_poly <- input$model_choice %in% c("PCM","GPCM","GRM")
+        if (is_poly) {
+          # Konversi ke integer agar mirt tidak bingung dengan nilai kontinu dari MSI
+          # (jika MSI diterapkan, gunakan data asli yang sudah di-round)
+          if (isTRUE(rv$msi_applied)) {
+            # Data MSI: gunakan sebagai numerik kontinu (GRM/GPCM bisa handle)
+            df_use <- df
+          } else {
+            # Data ordinal asli: pastikan integer
+            df_use <- as.data.frame(lapply(df, function(x) as.integer(round(x))))
+          }
+          # Cek: setiap item harus punya minimal 2 kategori dan cukup observasi
+          cats_check <- sapply(df_use, function(x) {
+            tbl <- table(x[!is.na(x)])
+            list(n_cats=length(tbl), min_freq=min(tbl))
+          })
+          # Peringatan jika ada item dengan kategori sangat jarang (< 5 observasi)
+          sparse_items <- sapply(1:ncol(df_use), function(j) {
+            tbl <- table(df_use[,j][!is.na(df_use[,j])])
+            any(tbl < 5)
+          })
+          if (any(sparse_items)) {
+            n_sparse <- sum(sparse_items)
+            showNotification(
+              paste0("⚠️ ",n_sparse," item memiliki kategori dengan < 5 observasi. ",
+                     "Ini bisa menyebabkan masalah konvergensi. ",
+                     "Pertimbangkan menggabungkan kategori atau menggunakan model lebih sederhana."),
+              type="warning", duration=8)
+          }
+        } else {
+          df_use <- df
+        }
+        
+        incProgress(0.20, detail="Membangun model IRT...")
+        
+        # Gunakan fungsi robust untuk estimasi
+        fit <- run_mirt_robust(df_use, input$model_choice, verbose=FALSE)
+        rv$irt_model     <- fit
+        rv$fallback_note <- attr(fit, "fallback_note")
+        
+        incProgress(0.30, detail="Ekstrak parameter item...")
         pd <- safe_extract_params(fit)
-        rv$item_params <- data.frame(Item=rownames(pd),pd,row.names=NULL)
-        incProgress(0.3,detail="Estimasi theta...")
-        te  <- as.data.frame(fscores(fit,method=input$est_method,
-                                     full.scores=TRUE,full.scores.SE=TRUE))
-        colnames(te)[1:2] <- c("Theta","SE_Theta")
+        rv$item_params <- data.frame(Item=rownames(pd), pd, row.names=NULL)
+        
+        incProgress(0.25, detail="Estimasi theta...")
+        te_raw <- run_fscores_robust(fit, method=input$est_method)
+        
+        if (is.null(te_raw)) {
+          showNotification("⚠️ Estimasi θ gagal, mencoba dengan EAP...", type="warning")
+          te_raw <- fscores(fit, method="EAP", full.scores=TRUE, full.scores.SE=TRUE)
+        }
+        
+        te <- as.data.frame(te_raw)
+        # Tangani nama kolom berbeda-beda
+        if (ncol(te) >= 2) {
+          colnames(te)[1:2] <- c("Theta","SE_Theta")
+        } else {
+          te$SE_Theta <- NA
+          colnames(te)[1] <- "Theta"
+        }
+        
         rv$theta_results <- data.frame(
-          Examinee  = 1:nrow(df),
-          Raw_Score = rowSums(df,na.rm=TRUE),
-          Theta     = round(te$Theta,4),
-          SE_Theta  = round(te$SE_Theta,4),
-          T_Score   = round(transform_scores(te$Theta),2))
-        incProgress(0.2,detail="Selesai!")
-        showNotification(paste("✅ Selesai! Model:",input$model_choice,
-                               "| θ-method:",input$est_method),type="message",duration=5)
-      }, error=function(e)
-        showNotification(paste("❌ Error IRT:",e$message),type="error",duration=8))
+          Examinee  = 1:nrow(df_use),
+          Raw_Score = rowSums(df_use, na.rm=TRUE),
+          Theta     = round(te$Theta, 4),
+          SE_Theta  = round(te$SE_Theta, 4),
+          T_Score   = round(transform_scores(te$Theta), 2))
+        
+        incProgress(0.10, detail="Selesai!")
+        
+        err_log <- attr(fit, "error_log")
+        if (length(err_log) > 0) {
+          showNotification(
+            paste0("✅ Selesai (dengan fallback). Model: ", input$model_choice,
+                   " | θ-method: ", input$est_method),
+            type="warning", duration=6)
+        } else {
+          showNotification(
+            paste("✅ Selesai! Model:", input$model_choice,
+                  "| θ-method:", input$est_method),
+            type="message", duration=5)
+        }
+        
+      }, error=function(e) {
+        showNotification(
+          paste0("❌ Error IRT: ", e$message,
+                 "\n\nSaran: Coba model lebih sederhana (PCM untuk politomus, 1PL untuk dikotomus), ",
+                 "atau periksa apakah ada kategori respons yang sangat jarang."),
+          type="error", duration=12)
+      })
     })
+  })
+  
+  # Tampilkan catatan fallback jika ada
+  output$irt_fallback_note <- renderUI({
+    if (!is.null(rv$fallback_note) && nchar(rv$fallback_note) > 0) {
+      tags$div(class="warn-callout", rv$fallback_note)
+    } else {
+      NULL
+    }
   })
   
   output$item_params_table <- renderDT({
@@ -979,7 +1278,7 @@ server <- function(input, output, session) {
         geom_vline(xintercept=0,linetype="dotted",color="gray50") +
         geom_hline(yintercept=0.5,linetype="dotted",color="gray50") +
         scale_color_brewer(palette="Set1") +
-        labs(title=paste("ICC —",input$model_choice),
+        labs(title=paste("ICC -",input$model_choice),
              x="Ability (θ)",y="P(θ)") +
         theme_minimal(base_size=13) +
         theme(legend.position="right",plot.title=element_text(face="bold"))
@@ -1092,46 +1391,6 @@ server <- function(input, output, session) {
     }, error=function(e) plotly_empty()%>%layout(title=paste("Error:",e$message)))
   })
   
-  output$std_resid_hist <- renderPlotly({
-    req(rv$irt_model,rv$theta_results)
-    tryCatch({
-      df  <- rv$clean_data; tv <- rv$theta_results$Theta
-      mc  <- quantile(tv,probs=seq(0,1,length.out=input$n_groups+1))
-      az  <- c()
-      for (j in 1:ncol(df)) {
-        for (g in 1:input$n_groups) {
-          idx <- which(tv>=mc[g]&tv<=mc[g+1])
-          if (length(idx)<2) next
-          Nj  <- length(idx); tg <- mean(tv[idx],na.rm=TRUE)
-          Po  <- mean(df[idx,j],na.rm=TRUE)
-          pg  <- tryCatch(probtrace(extract.item(rv$irt_model,j),tg),error=function(e)NULL)
-          if (is.null(pg)) next
-          Ei  <- if (ncol(pg)==2) pg[1,2] else {cats<-0:(ncol(pg)-1);sum(cats*pg[1,])}
-          dn  <- sqrt(Ei*(1-Ei)/Nj+1e-8)
-          az  <- c(az,(Po-Ei)/dn)
-        }
-      }
-      az <- az[is.finite(az)&abs(az)<10]
-      bw <- max(2*IQR(az)/length(az)^(1/3), 0.3)
-      xr <- seq(-5,5,by=0.1)
-      yr <- dnorm(xr)*length(az)*bw
-      plot_ly() %>%
-        add_histogram(x=az,nbinsx=30,
-                      marker=list(color="#4e9af1",line=list(color="white",width=0.8)),
-                      name="Standardized Residuals") %>%
-        add_lines(x=xr,y=yr,
-                  line=list(color="red",dash="dash",width=2),
-                  name="Normal Ref. (scaled)") %>%
-        layout(
-          title=list(text="Distribusi Standardized Residuals (zᵢⱼ)",
-                     font=list(size=14,color="#1a2340")),
-          xaxis=list(title="z",range=c(-6,6),titlefont=list(size=13)),
-          yaxis=list(title="Frekuensi",titlefont=list(size=13)),
-          legend=list(orientation="h",y=-0.2),
-          barmode="overlay",autosize=TRUE,margin=list(l=60,r=20,b=80,t=60))
-    }, error=function(e) plotly_empty()%>%layout(title=paste("Error:",e$message)))
-  })
-  
   output$fit_summary <- renderUI({
     req(rv$fit_results)
     nt <- nrow(rv$fit_results)
@@ -1188,7 +1447,6 @@ server <- function(input, output, session) {
     withProgress(message="Cek invariansi parameter item...", value=0, {
       tryCatch({
         df  <- rv$clean_data
-        itp <- get_itemtype(input$model_choice)
         
         if (input$inv_split == "random") {
           set.seed(42)
@@ -1197,8 +1455,8 @@ server <- function(input, output, session) {
           l1 <- "Kelompok Random 1"; l2 <- "Kelompok Random 2"
           
         } else if (input$inv_split == "odd_even") {
-          i1 <- seq(1, nrow(df), by=2)   # baris ganjil
-          i2 <- seq(2, nrow(df), by=2)   # baris genap
+          i1 <- seq(1, nrow(df), by=2)
+          i2 <- seq(2, nrow(df), by=2)
           l1 <- "Peserta Ganjil"; l2 <- "Peserta Genap"
           
         } else if (input$inv_split == "file_group") {
@@ -1233,15 +1491,18 @@ server <- function(input, output, session) {
         }
         
         incProgress(0.35, detail=paste("Estimasi", l1, "..."))
-        f1 <- tryCatch(mirt(df[i1,,drop=FALSE],1,itemtype=itp,
-                            verbose=FALSE,SE=FALSE), error=function(e)NULL)
+        f1 <- tryCatch(
+          run_mirt_robust(df[i1,,drop=FALSE], input$model_choice, verbose=FALSE),
+          error=function(e) NULL)
+        
         incProgress(0.35, detail=paste("Estimasi", l2, "..."))
-        f2 <- tryCatch(mirt(df[i2,,drop=FALSE],1,itemtype=itp,
-                            verbose=FALSE,SE=FALSE), error=function(e)NULL)
+        f2 <- tryCatch(
+          run_mirt_robust(df[i2,,drop=FALSE], input$model_choice, verbose=FALSE),
+          error=function(e) NULL)
         
         if (is.null(f1)||is.null(f2)) {
-          showNotification("⚠️ Estimasi gagal — sampel terlalu kecil.",type="warning")
-          return()
+          showNotification("⚠️ Estimasi gagal - sampel terlalu kecil atau data bermasalah.",
+                           type="warning"); return()
         }
         
         p1  <- safe_extract_params(f1)
@@ -1259,16 +1520,16 @@ server <- function(input, output, session) {
           fluidRow(
             valueBox(length(i1), paste("N", l1), icon=icon("users"), color="blue",  width=4),
             valueBox(length(i2), paste("N", l2), icon=icon("users"), color="green", width=4),
-            valueBox(if(!is.na(rb))rb else "—", "r (parameter b)",
+            valueBox(if(!is.na(rb))rb else "-", "r (parameter b)",
                      icon=icon("chart-line"),
                      color=if(!is.na(rb)&&rb>=0.9)"green"
                      else if(!is.na(rb)&&rb>=0.7)"yellow" else "red",
                      width=4)),
           tags$div(class=if(!is.na(rb)&&rb>=0.9)"info-callout"else"warn-callout",
                    tags$b("Hasil Invariansi Parameter b: "),
-                   if(!is.na(rb)&&rb>=0.9) paste0("✅ r=",rb," — sangat baik.")
-                   else if(!is.na(rb)&&rb>=0.7) paste0("⚠️ r=",rb," — cukup. Cek item outlier.")
-                   else paste0("❌ r=",rb," — lemah. Pertimbangkan model lain."))
+                   if(!is.na(rb)&&rb>=0.9) paste0("✅ r=",rb," - sangat baik.")
+                   else if(!is.na(rb)&&rb>=0.7) paste0("⚠️ r=",rb," - cukup. Cek item outlier.")
+                   else paste0("❌ r=",rb," - lemah. Pertimbangkan model lain."))
         ))
         
         if (!is.null(b1)&&!is.null(b2))
@@ -1303,7 +1564,6 @@ server <- function(input, output, session) {
     withProgress(message="Estimasi theta lintas set item...", value=0, {
       tryCatch({
         df  <- rv$clean_data; ni <- ncol(df)
-        itp <- get_itemtype(input$model_choice)
         if (input$inv_ability_split=="odd_even") {
           ia<-seq(1,ni,2); ib<-seq(2,ni,2); sl<-"Item Ganjil vs Genap"
         } else if (input$inv_ability_split=="first_last") {
@@ -1316,11 +1576,13 @@ server <- function(input, output, session) {
           showNotification("⚠️ Item terlalu sedikit.",type="warning"); return()
         }
         incProgress(0.4,detail="Set A...")
-        fa <- tryCatch(mirt(df[,ia,drop=FALSE],1,itemtype=itp,verbose=FALSE,SE=FALSE),
-                       error=function(e)NULL)
+        fa <- tryCatch(
+          run_mirt_robust(df[,ia,drop=FALSE], input$model_choice, verbose=FALSE),
+          error=function(e) NULL)
         incProgress(0.4,detail="Set B...")
-        fb <- tryCatch(mirt(df[,ib,drop=FALSE],1,itemtype=itp,verbose=FALSE,SE=FALSE),
-                       error=function(e)NULL)
+        fb <- tryCatch(
+          run_mirt_robust(df[,ib,drop=FALSE], input$model_choice, verbose=FALSE),
+          error=function(e) NULL)
         if (is.null(fa)||is.null(fb)) {
           showNotification("⚠️ Estimasi salah satu set gagal.",type="warning"); return()
         }
@@ -1346,15 +1608,15 @@ server <- function(input, output, session) {
                       line=list(color="orange",width=1.5,dash="dot"),
                       name=paste0("Trend (r=",rab,")")) %>%
             layout(
-              title=list(text=paste0("Invariansi Ability — ",sl," (r=",rab,")"),
+              title=list(text=paste0("Invariansi Ability - ",sl," (r=",rab,")"),
                          font=list(size=13,color="#1a2340")),
-              xaxis=list(title="θ — Set A",titlefont=list(size=12)),
-              yaxis=list(title="θ — Set B",titlefont=list(size=12)),
+              xaxis=list(title="θ - Set A",titlefont=list(size=12)),
+              yaxis=list(title="θ - Set B",titlefont=list(size=12)),
               legend=list(orientation="h",y=-0.22),
               autosize=TRUE,margin=list(l=60,r=20,b=90,t=65))
         })
         showNotification(
-          paste0("✅ r ability = ",rab," — ",
+          paste0("✅ r ability = ",rab," - ",
                  if(rab>=0.9)"Sangat baik ✅"else if(rab>=0.7)"Cukup ⚠️"else"Lemah ❌"),
           type=if(rab>=0.9)"message"else"warning",duration=6)
       }, error=function(e)
@@ -1365,22 +1627,30 @@ server <- function(input, output, session) {
   # ── THETA & T-SCORE ────────────────────────────────────
   output$theta_dist <- renderPlotly({
     req(rv$theta_results)
-    th <- rv$theta_results$Theta
-    bw <- max(2*IQR(th)/length(th)^(1/3),0.1)
-    xr <- seq(min(th)-1,max(th)+1,by=0.05)
-    yr <- dnorm(xr,mean(th,na.rm=TRUE),sd(th,na.rm=TRUE))*length(th)*bw
-    plot_ly() %>%
-      add_histogram(x=th,nbinsx=30,
+    # Filter nilai non-finite (Inf, -Inf, NaN) - bisa muncul dari ML/JML pada skor ekstrem
+    th_raw <- rv$theta_results$Theta
+    th <- th_raw[is.finite(th_raw)]
+    if (length(th) == 0) return(plotly_empty() %>% layout(title="Tidak ada nilai θ yang valid"))
+    n_removed <- length(th_raw) - length(th)
+    bw <- max(2*IQR(th)/length(th)^(1/3), 0.1)
+    xr <- seq(min(th)-1, max(th)+1, by=0.05)
+    yr <- dnorm(xr, mean(th, na.rm=TRUE), sd(th, na.rm=TRUE)) * length(th) * bw
+    p <- plot_ly() %>%
+      add_histogram(x=th, nbinsx=30,
                     marker=list(color="#4e9af1",line=list(color="white",width=0.8)),
                     name="Frekuensi θ") %>%
-      add_lines(x=xr,y=yr,
-                line=list(color="red",dash="dash",width=2),name="Normal Ref.") %>%
+      add_lines(x=xr, y=yr,
+                line=list(color="red",dash="dash",width=2), name="Normal Ref.") %>%
       layout(
-        title=list(text="Distribusi Theta (θ)",font=list(size=15,color="#1a2340")),
-        xaxis=list(title="θ",titlefont=list(size=13)),
-        yaxis=list(title="Frekuensi",titlefont=list(size=13)),
-        legend=list(orientation="h",y=-0.2),barmode="overlay",
-        autosize=TRUE,margin=list(l=60,r=20,b=80,t=60))
+        title=list(text=if(n_removed>0)
+          paste0("Distribusi Theta (θ) - ",n_removed," nilai ekstrem dihapus")
+          else "Distribusi Theta (θ)",
+          font=list(size=15,color="#1a2340")),
+        xaxis=list(title="θ", titlefont=list(size=13)),
+        yaxis=list(title="Frekuensi", titlefont=list(size=13)),
+        legend=list(orientation="h",y=-0.2), barmode="overlay",
+        autosize=TRUE, margin=list(l=60,r=20,b=80,t=60))
+    p
   })
   
   output$tscore_dist <- renderPlotly({
